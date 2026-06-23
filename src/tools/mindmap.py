@@ -122,8 +122,8 @@ class MindMap():
         self.max_workers = workers
         print('MindMap initialized')
 
-    def build_map(self, topic: str):
-        root_info = self.retriever(topic)
+    def build_map(self, topic: str, initial_queries: Optional[List[str]] = None):
+        root_info = self.retriever(initial_queries or topic)
         root_concept = self.concept_generator(root_info)
         root = MindPoint(root=True, info=root_info, concept=root_concept, lm=self.gen_concept_lm, retriever=self.retriever, category=topic)
         self.root = root
@@ -225,8 +225,8 @@ class MindMap():
         Prepare collected snippets and URLs for retrieval by encoding the snippets using paraphrase-MiniLM-L6-v2.
         collected_urls and collected_snippets have corresponding indices.
         """
-        # self.encoder = SentenceTransformer('/mnt/nas-alinlp/xizekun/huggingface_cache/all-MiniLM-L6-v2')
-        self.encoder = SentenceTransformer('/tmp/pycharm_project_773/Models')
+        model_name = os.environ.get("SENTENCE_TRANSFORMER_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+        self.encoder = SentenceTransformer(model_name)
         self.collected_urls = []
         self.collected_snippets = []
         seen_urls = set()
@@ -240,6 +240,10 @@ class MindMap():
                     self.collected_urls.append(url)
                     self.collected_snippets.append(snippet)
 
+        if not self.collected_snippets:
+            self.encoded_snippets = np.array([])
+            return
+
         self.encoded_snippets = self.encoder.encode(self.collected_snippets, show_progress_bar=True)
 
     def retrieve_information(self, queries: Union[List[str], str], search_top_k) -> List[Dict[str, any]]:
@@ -249,6 +253,8 @@ class MindMap():
         """
         selected_urls = []
         selected_snippets = []
+        if not getattr(self, "collected_snippets", None):
+            return []
         if type(queries) is str:
             queries = [queries]
         for query in queries:

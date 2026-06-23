@@ -8,6 +8,7 @@ import uuid
 import json
 import random
 import time
+import threading
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
@@ -22,6 +23,337 @@ def clean_text(res):
     result = re.sub(url_pattern, '', result)
     result = re.sub(r"\n\n+", "\n", result)
     return result
+
+
+LEAKAGE_DOMAIN_PATTERNS = {
+    "cnx.org",
+    "openstax.org",
+    "pressbooks.pub",
+    "pb.unizin.org",
+    "libretexts.org",
+    "courses.lumenlearning.com",
+    "lumenlearning.com",
+    "open.lib.umn.edu",
+    "open.oregonstate.education",
+    "open.maricopa.edu",
+    "openwa.pressbooks.pub",
+    "openfl.pressbooks.pub",
+    "openoregon.pressbooks.pub",
+    "louis.pressbooks.pub",
+    "lmu.pressbooks.pub",
+    "minnstate.pressbooks.pub",
+    "ecampusontario.pressbooks.pub",
+    "pressbooks.atlanticoer-relatlantique.ca",
+    "erau.edu",
+    "eaglepubs.erau.edu",
+}
+
+LEAKAGE_HOST_KEYWORDS = {
+    "pressbooks",
+}
+
+
+def _source_url(source):
+    if isinstance(source, dict):
+        return (
+            source.get("url")
+            or source.get("link")
+            or source.get("host")
+            or ""
+        )
+    return source or ""
+
+
+def _source_text(source):
+    if isinstance(source, dict):
+        parts = [
+            source.get("url", ""),
+            source.get("link", ""),
+            source.get("title", ""),
+            source.get("description", ""),
+            source.get("snippet", ""),
+        ]
+        snippets = source.get("snippets") or []
+        if isinstance(snippets, str):
+            parts.append(snippets)
+        else:
+            parts.extend(snippets)
+        return " ".join(str(part or "") for part in parts).lower()
+    return str(source or "").lower()
+
+
+def _url_path(source):
+    value = (_source_url(source) or "").strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"https://{value}"
+    try:
+        from urllib.parse import urlparse
+
+        return urlparse(value).path.lower()
+    except Exception:
+        return value.lower()
+
+
+def _normalize_host(url_or_host):
+    value = (_source_url(url_or_host) or "").strip().lower()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"https://{value}"
+
+    try:
+        from urllib.parse import urlparse
+
+        host = urlparse(value).netloc or urlparse(value).path
+    except Exception:
+        host = value
+
+    host = host.split("@")[-1].split(":")[0].strip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _is_edu_host(host):
+    return host == "edu" or host.endswith(".edu")
+
+
+def _is_edu_pdf_source(source, host):
+    if not _is_edu_host(host):
+        return False
+    path = _url_path(source)
+    text = _source_text(source)
+    return path.endswith(".pdf") or ".pdf/" in path or "[pdf]" in text
+
+
+def is_leakage_url(source):
+    host = _normalize_host(source)
+    if not host:
+        return False
+
+    if _is_edu_pdf_source(source, host):
+        return True
+
+    for domain in LEAKAGE_DOMAIN_PATTERNS:
+        normalized_domain = _normalize_host(domain)
+        if host == normalized_domain or host.endswith(f".{normalized_domain}"):
+            return True
+
+    return any(keyword in host for keyword in LEAKAGE_HOST_KEYWORDS)
+
+
+def is_allowed_source(url):
+    return not is_leakage_url(url)
+
+
+class SerperSearch(dspy.Retrieve):
+    def __init__(self, serper_api_key=None, k=3, is_valid_source: Callable = None,
+                 min_char_count: int = 150, snippet_chunk_size: int = 1000, webpage_helper_max_threads=10,
+                 query_budget: Optional[int] = None, source_budget: Optional[int] = None,
+                 gl: str = "us", hl: str = "en", endpoint: str = "https://google.serper.dev/search",
+                 is_valid_query: Callable = None, blocked_sample_limit: int = 20,
+                 **kwargs):
+        super().__init__(k=k)
+        self.serper_api_key = serper_api_key or os.environ.get("SERPER_API_KEY") or os.environ.get("SEARCHKEY")
+        if not self.serper_api_key:
+            raise RuntimeError("Set SERPER_API_KEY or SEARCHKEY before using SerperSearch.")
+        self.k = k
+        self.endpoint = endpoint
+        self.gl = gl
+        self.hl = hl
+        self.params = kwargs
+        self.query_budget = query_budget
+        self.source_budget = source_budget
+        self.usage = 0
+        self.skipped_queries = 0
+        self.accepted_urls = set()
+        self.blocked_sample_limit = blocked_sample_limit
+        self.leakage_query_blocked_count = 0
+        self.leakage_source_blocked_count = 0
+        self.blocked_query_samples = []
+        self.blocked_source_samples = []
+        self._budget_lock = threading.Lock()
+        self.webpage_helper = WebPageHelper(
+            min_char_count=min_char_count,
+            snippet_chunk_size=snippet_chunk_size,
+            max_thread_num=webpage_helper_max_threads
+        )
+        self.custom_is_valid_source = is_valid_source or (lambda _u: True)
+        self.custom_is_valid_query = is_valid_query or (lambda _q: True)
+
+    def _custom_source_allowed(self, source: Dict[str, Any]) -> bool:
+        try:
+            return bool(self.custom_is_valid_source(source))
+        except Exception:
+            try:
+                return bool(self.custom_is_valid_source(_source_url(source)))
+            except Exception:
+                return False
+
+    def _record_blocked_query(self, query: str, reason: str = "leakage"):
+        with self._budget_lock:
+            self.leakage_query_blocked_count += 1
+            if len(self.blocked_query_samples) < self.blocked_sample_limit:
+                self.blocked_query_samples.append({"query": query, "reason": reason})
+
+    def _record_blocked_source(self, source: Dict[str, Any], reason: str = "leakage"):
+        with self._budget_lock:
+            self.leakage_source_blocked_count += 1
+            if len(self.blocked_source_samples) < self.blocked_sample_limit:
+                self.blocked_source_samples.append({
+                    "url": _source_url(source),
+                    "title": source.get("title", "") if isinstance(source, dict) else "",
+                    "description": source.get("description", "") if isinstance(source, dict) else "",
+                    "reason": reason,
+                })
+
+    def _query_allowed(self, query: str) -> bool:
+        try:
+            allowed = bool(self.custom_is_valid_query(query))
+        except Exception:
+            allowed = False
+        if not allowed:
+            self._record_blocked_query(query)
+        return allowed
+
+    def _source_allowed(self, source: Dict[str, Any]) -> bool:
+        if not is_allowed_source(source):
+            self._record_blocked_source(source, reason="static_leakage_filter")
+            return False
+        if not self._custom_source_allowed(source):
+            self._record_blocked_source(source, reason="chapter_leakage_filter")
+            return False
+        return True
+
+    def set_budget(self, query_budget: Optional[int] = None, source_budget: Optional[int] = None):
+        with self._budget_lock:
+            self.query_budget = query_budget
+            self.source_budget = source_budget
+            self.usage = 0
+            self.skipped_queries = 0
+            self.accepted_urls = set()
+            self.leakage_query_blocked_count = 0
+            self.leakage_source_blocked_count = 0
+            self.blocked_query_samples = []
+            self.blocked_source_samples = []
+
+    def _reserve_queries(self, queries: List[str]) -> List[str]:
+        with self._budget_lock:
+            if self.query_budget is None:
+                allowed = len(queries)
+            else:
+                allowed = max(self.query_budget - self.usage, 0)
+            selected = queries[:allowed]
+            self.usage += len(selected)
+            self.skipped_queries += max(len(queries) - len(selected), 0)
+        return selected
+
+    def _can_accept_url(self, url: str) -> bool:
+        if url in self.accepted_urls:
+            return True
+        if self.source_budget is not None and len(self.accepted_urls) >= self.source_budget:
+            return False
+        return True
+
+    def _mark_accepted_url(self, url: str):
+        if url not in self.accepted_urls:
+            self.accepted_urls.add(url)
+
+    def get_budget_report(self) -> Dict[str, Optional[int]]:
+        return {
+            "query_budget": self.query_budget,
+            "queries_used": self.usage,
+            "queries_skipped": self.skipped_queries,
+            "source_budget": self.source_budget,
+            "sources_accepted": len(self.accepted_urls),
+            "leakage_query_blocked_count": self.leakage_query_blocked_count,
+            "leakage_source_blocked_count": self.leakage_source_blocked_count,
+        }
+
+    def get_usage_and_reset(self):
+        usage = self.usage
+        accepted_sources = len(self.accepted_urls)
+        blocked_queries = self.leakage_query_blocked_count
+        blocked_sources = self.leakage_source_blocked_count
+        self.usage = 0
+        self.skipped_queries = 0
+        self.accepted_urls = set()
+        self.leakage_query_blocked_count = 0
+        self.leakage_source_blocked_count = 0
+        self.blocked_query_samples = []
+        self.blocked_source_samples = []
+        return {
+            'SerperSearch': usage,
+            'SerperAcceptedSources': accepted_sources,
+            'SerperLeakageQueriesBlocked': blocked_queries,
+            'SerperLeakageSourcesBlocked': blocked_sources,
+        }
+
+    def get_leakage_report(self) -> Dict[str, Any]:
+        return {
+            "leakage_query_blocked_count": self.leakage_query_blocked_count,
+            "leakage_source_blocked_count": self.leakage_source_blocked_count,
+            "blocked_query_samples": list(self.blocked_query_samples),
+            "blocked_source_samples": list(self.blocked_source_samples),
+            "accepted_urls": sorted(self.accepted_urls),
+        }
+
+    def forward(self, query_or_queries: Union[str, List[str]], exclude_urls: List[str] = []):
+        queries = [query_or_queries] if isinstance(query_or_queries, str) else list(query_or_queries)
+        queries = [query for query in queries if query]
+        queries = [query for query in queries if self._query_allowed(query)]
+        queries = self._reserve_queries(queries)
+        if not queries:
+            return []
+
+        url_to_results: Dict[str, Dict[str, Any]] = {}
+        headers = {
+            "X-API-KEY": self.serper_api_key,
+            "Content-Type": "application/json",
+        }
+
+        for query in queries:
+            try:
+                payload = {
+                    "q": query,
+                    "num": self.k,
+                    "gl": self.gl,
+                    "hl": self.hl,
+                    **self.params,
+                }
+                response = requests.post(self.endpoint, headers=headers, json=payload, timeout=30)
+                response.raise_for_status()
+                results = response.json()
+                for result in results.get("organic", []):
+                    url = result.get("link")
+                    source = {
+                        "url": url,
+                        "title": result.get("title", ""),
+                        "description": result.get("snippet", ""),
+                    }
+                    if not url or url in exclude_urls or not self._source_allowed(source):
+                        continue
+                    if not self._can_accept_url(url):
+                        continue
+                    url_to_results[url] = source
+            except Exception as e:
+                logging.error(f"Error occurs when searching query {query}: {e}")
+
+        valid_url_to_snippets = self.webpage_helper.urls_to_snippets(list(url_to_results.keys()))
+        collected_results = []
+        for url in valid_url_to_snippets:
+            r = url_to_results[url]
+            r["snippets"] = valid_url_to_snippets[url]["snippets"]
+            if not self._source_allowed(r):
+                continue
+            with self._budget_lock:
+                if not self._can_accept_url(url):
+                    continue
+                self._mark_accepted_url(url)
+            collected_results.append(r)
+        return collected_results
 
 class GoogleSearchAli(dspy.Retrieve):
     def __init__(self, bing_search_api_key=None, k=3, is_valid_source: Callable = None,
@@ -483,5 +815,3 @@ class LocalSearch(dspy.Retrieve):
                     "snippets": [h.get("snippet", "")],
                 }
         return list(url_to_results.values())
-
-

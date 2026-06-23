@@ -1,4 +1,5 @@
 import random
+import requests
 import threading
 import time
 import dspy
@@ -20,11 +21,26 @@ class OpenAIModel_dashscope(dspy.OpenAI):
             model: str = "gpt-4o",
             max_tokens: int = 2000,
             api_key: Optional[str] = None,
+            base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            system_prompt: Optional[str] = None,
+            enable_cache: bool = False,
+            timeout: int = 1000,
+            max_retries: int = 10,
             **kwargs
     ):
-        super().__init__(model=model, api_key=api_key, base_url='https://api.gpts.vin/', **kwargs)
-        print(model)
+        super().__init__(model=model, api_key=api_key, api_base=base_url, **kwargs)
         self.model = model
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.system_prompt = system_prompt
+        self.enable_cache = enable_cache
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.request_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if value is not None and key not in {"api_base", "api_provider", "api_version"}
+        }
         self._token_usage_lock = threading.Lock()
         self.max_tokens = max_tokens
         self.prompt_tokens = 0
@@ -35,8 +51,8 @@ class OpenAIModel_dashscope(dspy.OpenAI):
         usage_data = response.get('usage')
         if usage_data:
             with self._token_usage_lock:
-                self.prompt_tokens += usage_data.get('input_tokens', 0)
-                self.completion_tokens += usage_data.get('output_tokens', 0)
+                self.prompt_tokens += usage_data.get('prompt_tokens', usage_data.get('input_tokens', 0))
+                self.completion_tokens += usage_data.get('completion_tokens', usage_data.get('output_tokens', 0))
 
     def get_usage_and_reset(self):
         """Get the total tokens used and reset the token usage."""
@@ -48,6 +64,21 @@ class OpenAIModel_dashscope(dspy.OpenAI):
         self.completion_tokens = 0
 
         return usage
+
+    def _build_messages(self, prompt: str):
+        messages = []
+        if self.system_prompt:
+            if self.enable_cache:
+                system_content = [{
+                    "type": "text",
+                    "text": self.system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+            else:
+                system_content = self.system_prompt
+            messages.append({"role": "system", "content": system_content})
+        messages.append({"role": "user", "content": prompt})
+        return messages
 
     def __call__(
             self,
@@ -61,35 +92,40 @@ class OpenAIModel_dashscope(dspy.OpenAI):
         assert only_completed, "for now"
         assert return_sorted is False, "for now"
 
-        CALL_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'
-        LM_KEY = os.getenv('LM_KEY')
+        call_url = f"{self.base_url}/chat/completions"
+        lm_key = self.api_key or os.getenv('DASHSCOPE_API_KEY') or os.getenv('LM_KEY')
+        if not lm_key:
+            raise RuntimeError("Set DASHSCOPE_API_KEY or LM_KEY before calling DashScope models.")
         HEADERS = {
             'Content-Type': 'application/json',
-            "Authorization": f"Bearer {LM_KEY}"
+            "Authorization": f"Bearer {lm_key}"
         }
 
-        kwargs = dict(
+        payload = dict(
             model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=self.max_tokens,
+            messages=self._build_messages(prompt),
+            max_tokens=self.max_tokens,
             stream=False,
+            **self.request_kwargs,
         )
-        import requests
-        max_try = 10
-        for i in range(max_try):
+        last_error = None
+        for _ in range(self.max_retries):
             try:
-                ret = requests.post(CALL_URL, json=kwargs,
-                                    headers=HEADERS, timeout=1000)
+                ret = requests.post(call_url, json=payload,
+                                    headers=HEADERS, timeout=self.timeout)
                 if ret.status_code != 200:
                     raise Exception(f"http status_code: {ret.status_code}\n{ret.content}")
                 ret_json = ret.json()
                 for output in ret_json['choices']:
                     if output['finish_reason'] not in ['stop', 'function_call']:
                         raise Exception(f'openai finish with error...\n{ret_json}')
+                self.log_usage(ret_json)
                 return [ret_json['choices'][0]['message']['content']]
             except Exception as e:
-                print(f"请求失败: {e}. 尝试重新请求...")    
+                last_error = e
+                print(f"请求失败: {e}. 尝试重新请求...")
                 time.sleep(1)
+        raise RuntimeError(f"DashScope request failed after {self.max_retries} retries: {last_error}")
 
 
 class DeepSeekModel(dspy.OpenAI):
