@@ -8,6 +8,7 @@ google-cloud==0.34.0
 google-cloud-vision==3.5.0
 google-cloud-storage==2.14.0
 sentence_transformers
+faiss-cpu==1.14.3
 toml==0.10.2
 dspy==2.5.29
 markdown

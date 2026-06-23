@@ -8,7 +8,7 @@ OUTPUTDIR="${OUTPUTDIR:-results/chapter_benchmark_textbooks}"
 RUN_ROOT="${RUN_ROOT:-$OUTPUTDIR/_runs}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 RUNDIR="${RUNDIR:-$RUN_ROOT/$RUN_ID}"
-CHAPTER_WORKERS="${CHAPTER_WORKERS:-2}"
+CHAPTER_WORKERS="${CHAPTER_WORKERS:-4}"
 SECTION_THREADS="${SECTION_THREADS:-1}"
 FAST_MODEL="${FAST_MODEL:-qwen3.6-flash}"
 STRONG_MODEL="${STRONG_MODEL:-qwen3.7-plus}"
@@ -18,6 +18,9 @@ DEPTH="${DEPTH:-1}"
 MAX_OUTLINE_ATTEMPTS="${MAX_OUTLINE_ATTEMPTS:-2}"
 
 mkdir -p "$RUNDIR"
+
+echo "Running chapter benchmark with CHAPTER_WORKERS=$CHAPTER_WORKERS SECTION_THREADS=$SECTION_THREADS"
+echo "Run logs: $RUNDIR"
 
 cmd=(
   python -m examples.chapter_benchmark_textbook

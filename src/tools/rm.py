@@ -52,6 +52,28 @@ LEAKAGE_HOST_KEYWORDS = {
     "pressbooks",
 }
 
+UNUSABLE_DOMAIN_PATTERNS = {
+    "youtube.com",
+    "youtu.be",
+    "vimeo.com",
+}
+
+UNUSABLE_HOST_KEYWORDS = {
+    "youtube",
+}
+
+UNUSABLE_PATH_KEYWORDS = {
+    "/solution/",
+    "/solutions/",
+    "/textbook-solutions/",
+    "/video/",
+    "/watch",
+}
+
+UNUSABLE_TEXT_MARKERS = {
+    "[pdf]",
+}
+
 
 def _source_url(source):
     if isinstance(source, dict):
@@ -123,6 +145,10 @@ def _is_edu_host(host):
 def _is_edu_pdf_source(source, host):
     if not _is_edu_host(host):
         return False
+    return _is_pdf_source(source)
+
+
+def _is_pdf_source(source):
     path = _url_path(source)
     text = _source_text(source)
     return path.endswith(".pdf") or ".pdf/" in path or "[pdf]" in text
@@ -144,8 +170,32 @@ def is_leakage_url(source):
     return any(keyword in host for keyword in LEAKAGE_HOST_KEYWORDS)
 
 
+def is_unusable_source(source):
+    host = _normalize_host(source)
+    if not host:
+        return False
+
+    if _is_pdf_source(source):
+        return True
+
+    for domain in UNUSABLE_DOMAIN_PATTERNS:
+        normalized_domain = _normalize_host(domain)
+        if host == normalized_domain or host.endswith(f".{normalized_domain}"):
+            return True
+
+    if any(keyword in host for keyword in UNUSABLE_HOST_KEYWORDS):
+        return True
+
+    path = _url_path(source)
+    if any(keyword in path for keyword in UNUSABLE_PATH_KEYWORDS):
+        return True
+
+    text = _source_text(source)
+    return any(marker in text for marker in UNUSABLE_TEXT_MARKERS)
+
+
 def is_allowed_source(url):
-    return not is_leakage_url(url)
+    return not is_leakage_url(url) and not is_unusable_source(url)
 
 
 class SerperSearch(dspy.Retrieve):

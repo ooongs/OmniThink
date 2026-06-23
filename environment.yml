@@ -71,6 +71,7 @@ dependencies:
       - entrypoints==0.4
       - extra-streamlit-components==0.1.60
       - faker==35.0.0
+      - faiss-cpu==1.14.3
       - fastapi==0.111.1
       - fastapi-cli==0.0.7
       - fastapi-sso==0.10.0

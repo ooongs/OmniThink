@@ -1,4 +1,5 @@
 import concurrent.futures
+import logging
 from typing import List, Dict
 
 import httpx
@@ -46,9 +47,16 @@ class WebPageHelper:
             res = self.httpx_client.get(url, timeout=4)
             if res.status_code >= 400:
                 res.raise_for_status()
+            content_type = res.headers.get("content-type", "").lower()
+            if content_type and not any(
+                allowed in content_type
+                for allowed in ("text/html", "text/plain", "application/xhtml+xml", "application/xml", "text/xml")
+            ):
+                logging.debug("Skipping non-HTML response %s with content-type %s", url, content_type)
+                return None
             return res.content
         except httpx.HTTPError as exc:
-            print(f"Error while requesting {exc.request.url!r} - {exc!r}")
+            logging.debug("Error while requesting %r - %r", exc.request.url, exc)
             return None
 
     def urls_to_articles(self, urls: List[str]) -> Dict:
